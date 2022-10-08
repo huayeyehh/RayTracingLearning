@@ -1,0 +1,349 @@
+/* -------------------- Kernel Definitions -------------------- */
+#pragma kernel ComputeShaderMain
+
+/* -------------------- Structure Definitions -------------------- */
+// Light Ray
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float3 energy;
+};
+
+// Light Ray Hit Point
+struct RayHit
+{
+    float3 position;
+    float3 normal;
+    float4 albedo;
+    float3 specular;
+    float  distance;
+};
+
+// Mesh Object
+struct MeshObject
+{
+    float4x4 localToWorldMatrix;
+    float4 albedo;
+    float3 specular;
+    int indices_offset;
+    int indices_count;
+};
+
+// BVHMeshObject
+struct BVHMeshObject
+{
+    float4x4 localToWorldMatrix;
+    float4 albedo;
+    float3 specular;
+};
+
+// BVHListNode
+struct BVHListNode
+{
+    float3 bmin;  // bounding box min
+    float3 bmax;  // bounding box max
+    int left;     // left node index, vertex0 index if leaf
+    int right;    // right node index, vertex1 index if leaf
+    int isLeaf;   // -1 if internal node, vertex2 index if leaf
+    int extra;    // -1 if mesh bbox, BVHMeshObject index if triangle bbox
+};
+
+/* -------------------- Variables From C# -------------------- */
+RWTexture2D<float4> _Result;
+Texture2D<float4>   _Source;
+Texture2D<float4>   _SkyboxTexture;
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float4   _DirectionalLight;
+bool     _UseBVH;
+int      _RayTracingDepth;  // Reflection times for one ray.
+
+// Structured buffers for meshes
+StructuredBuffer<MeshObject> _MeshObjects;
+StructuredBuffer<float3>     _Vertices;
+StructuredBuffer<int>        _Indices;
+int _MeshObjectsCount;
+
+// Structured buffers for BVH
+StructuredBuffer<BVHMeshObject> _BVHMeshObjects;
+StructuredBuffer<BVHListNode>   _BVHNodeList;
+StructuredBuffer<float3>        _BVHVertices;
+int _BVHLeafCount;
+
+/* -------------------- Local Variables -------------------- */
+SamplerState sampler_SkyboxTexture;
+static const float PI = 3.1415926f;
+static const float EPSILON = 1e-8;  // for triangle intersection
+static const int BVHIndexMaxLength = 64;
+
+/* -------------------- Functions -------------------- */
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = 1.0f;
+    return ray;
+}
+
+// uv is the pos of the point in screen
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = normalize(mul(_CameraToWorld, float4(direction, 0.0f)).xyz);
+    
+    return CreateRay(origin, direction);
+}
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = 0.0f;
+    hit.normal   = 0.0f;
+    hit.specular = 0.0f;
+    hit.albedo   = 0.0f;
+    hit.distance = 1.#INF;
+    return hit;
+}
+
+// Ground Intersection, inout to pass the reference of the variable
+void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
+{
+    // Calculate distance along the ray where the ground plane is intersected
+    float t = -ray.origin.y / ray.direction.y;  // (ground.y - origin.y) / direction.y, ground.y = 0
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = ray.origin + t * ray.direction;
+        bestHit.normal   = float3(0.0f, 1.0f, 0.0f);  // normal of ground is always up
+        bestHit.specular = 0.7f;
+        bestHit.albedo   = 0.0f;
+    }
+}
+
+// Triangle Intersection, Code from: https://fileadmin.cs.lth.se/cs/Personal/Tomas_Akenine-Moller/pubs/raytri_tam.pdf
+bool IntersectTriangle(Ray ray, float3 v0, float3 v1, float3 v2, inout float t, inout float u, inout float v)
+{
+    // Find vectors for two edges sharing v0
+    float3 e1 = v1 - v0;
+    float3 e2 = v2 - v0;
+    // Begin calculating determinant - also used to calculate U parameter
+    float3 pvec = cross(ray.direction, e2);
+    // If determinant is near zero, ray lies in plane of triangle
+    float det = dot(e1, pvec);
+    if (det < EPSILON) return false;
+    // Use backface culling
+    float inv_det = 1.0f / det;
+    // Calculate distance from v0 to ray origin
+    float3 tvec = ray.origin - v0;
+    // Calculate U parameter and test bounds
+    u = dot(tvec, pvec) * inv_det;
+    if (u < 0.0f || u > 1.0f) return false;
+    // Prepare to test V parameter
+    float3 qvec = cross(tvec, e1);
+    // Calculate V parameter and test bounds
+    v = dot(ray.direction, qvec) * inv_det;
+    if (v < 0.0f || u + v > 1.0f) return false;
+    // Calculate t, ray intersects triangle
+    t = dot(e2, qvec) * inv_det;
+    return true;
+}
+
+// Mesh Object Intersection
+void IntersectMeshObject(Ray ray, inout RayHit bestHit, MeshObject meshObject)
+{
+    uint offset = meshObject.indices_offset;
+    uint count  = offset + meshObject.indices_count;
+    for (uint i = offset; i < count; i += 3)
+    {
+        float3 v0 = (mul(meshObject.localToWorldMatrix, float4(_Vertices[_Indices[i]], 1.0f))).xyz;
+        float3 v1 = (mul(meshObject.localToWorldMatrix, float4(_Vertices[_Indices[i+1]], 1.0f))).xyz;
+        float3 v2 = (mul(meshObject.localToWorldMatrix, float4(_Vertices[_Indices[i+2]], 1.0f))).xyz;
+
+        float t, u, v;
+        if (IntersectTriangle(ray, v0, v1, v2, t, u, v))
+        {
+            if (t > 0 && t < bestHit.distance)
+            {
+                bestHit.distance = t;
+                bestHit.position = ray.origin + t * ray.direction;
+                bestHit.normal   = normalize(cross(v1 - v0, v2 - v0));
+                bestHit.albedo   = meshObject.albedo;
+                bestHit.specular = meshObject.specular;
+            }
+        }
+    }
+}
+
+// Bounding Box Intersection
+void swap(inout float a, inout float b)
+{
+    float temp = a;
+    a = b;
+    b = temp;
+}
+bool IntersectBBox(float3 origin, float3 dirInv, bool3 dirIsNeg, float3 bmin, float3 bmax, inout float t_enter)
+{
+    // bounding box bug fix
+    // 因为模型的BVH是提前计算好并重复利用,所以计算的时候用的都是相对坐标,
+    // 导致计算boundingbox的时候需要乘以localToWorldMatrix,
+    // 如果模型有旋转的话就会导致boundingbox的某个坐标max和min反过来了
+    if (bmin.x > bmax.x) swap(bmin.x, bmax.x);
+    if (bmin.y > bmax.y) swap(bmin.y, bmax.y);
+    if (bmin.z > bmax.z) swap(bmin.z, bmax.z);
+    // x slab
+    float xmin = (bmin.x - origin.x) * dirInv.x;
+    float xmax = (bmax.x - origin.x) * dirInv.x;
+    if (dirIsNeg[0]) swap(xmin, xmax);
+
+    // y slab
+    float ymin = (bmin.y - origin.y) * dirInv.y;
+    float ymax = (bmax.y - origin.y) * dirInv.y;
+    if (dirIsNeg[1]) swap(ymin, ymax);
+
+    // z slab
+    float zmin = (bmin.z - origin.z) * dirInv.z;
+    float zmax = (bmax.z - origin.z) * dirInv.z;
+    if (dirIsNeg[2]) swap(zmin, zmax);
+
+    t_enter = max(zmin, max(xmin, ymin));
+    float t_exit  = min(zmax, min(xmax, ymax));
+    return t_exit >= 0 && t_enter <= t_exit;
+}
+
+// BVH Intersection Using Stack
+void IntersectBVH(Ray ray, inout RayHit bestHit, float3 dirInv, bool3 dirIsNeg)
+{
+    int stackIndex[BVHIndexMaxLength];
+    stackIndex[0] = 0;
+    uint ptr = 0;
+    BVHListNode node;
+    while (ptr >= 0 && ptr < BVHIndexMaxLength)
+    {
+        node = _BVHNodeList[stackIndex[ptr--]];
+        // Test if node intersect bounding box
+        float3 bmin, bmax;
+        float t_enter;
+        if (node.extra == -1)
+        {
+            bmin = node.bmin;
+            bmax = node.bmax;
+        }
+        else
+        {
+            bmin = (mul(_BVHMeshObjects[node.extra].localToWorldMatrix, float4(node.bmin, 1.0f))).xyz;
+            bmax = (mul(_BVHMeshObjects[node.extra].localToWorldMatrix, float4(node.bmax, 1.0f))).xyz;
+        }
+        if (IntersectBBox(ray.origin, dirInv, dirIsNeg, bmin, bmax, t_enter) && t_enter <= bestHit.distance)
+        {
+            if (node.isLeaf == -1)
+            {
+                // Internal node: add left and right node to the stack
+                stackIndex[++ptr] = node.left;
+                stackIndex[++ptr] = node.right;
+            }
+            else
+            {
+                // Leaf node
+                float3 v0 = (mul(_BVHMeshObjects[node.extra].localToWorldMatrix, float4(_BVHVertices[node.left], 1.0f))).xyz;
+                float3 v1 = (mul(_BVHMeshObjects[node.extra].localToWorldMatrix, float4(_BVHVertices[node.right], 1.0f))).xyz;
+                float3 v2 = (mul(_BVHMeshObjects[node.extra].localToWorldMatrix, float4(_BVHVertices[node.isLeaf], 1.0f))).xyz;
+                float t, u, v;
+                if (IntersectTriangle(ray, v0, v1, v2, t, u, v))
+                {
+                    if (t > 0 && t < bestHit.distance)
+                    {
+                        bestHit.distance = t;
+                        bestHit.position = ray.origin + t * ray.direction;
+                        bestHit.normal   = normalize(cross(v1 - v0, v2 - v0));
+                        bestHit.albedo   = _BVHMeshObjects[node.extra].albedo;
+                        bestHit.specular = _BVHMeshObjects[node.extra].specular;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Trace Function
+RayHit Trace(Ray ray)
+{
+    // Init ray hit
+    RayHit bestHit = CreateRayHit();
+    // Intersect ground
+    IntersectGroundPlane(ray, bestHit);
+    // Intersect mesh object
+    if (_UseBVH)
+    {
+        float3 dirInv = float3(1.0f / ray.direction.x, 1.0f / ray.direction.y, 1.0f / ray.direction.z);
+        bool3 dirIsNeg = bool3(ray.direction.x < 0, ray.direction.y < 0, ray.direction.z < 0);
+        IntersectBVH(ray, bestHit, dirInv, dirIsNeg);
+    }
+    else
+        for (int i = 0; i < _MeshObjectsCount; i++)
+            IntersectMeshObject(ray, bestHit, _MeshObjects[i]);
+
+    return bestHit;
+}
+
+// Shade Function
+float3 Shade(inout Ray ray, RayHit hit)
+{
+    if (hit.distance < 1.#INF)
+    {
+        // Ray hit something
+        ray.origin = hit.position + hit.normal * 0.0001f;
+        ray.direction = reflect(ray.direction, hit.normal);
+        ray.energy *= hit.specular;
+
+        // Shadow test ray
+        Ray shadowRay = CreateRay(hit.position + hit.normal * 0.0001f, -1 * _DirectionalLight.xyz);
+        RayHit shadowHit = Trace(shadowRay);
+        if (shadowHit.distance < 1.#INF) return float3(0.0f, 0.0f, 0.0f);
+
+        // Return color not in shadow, TODO: get color from texture, transparent mat
+        return saturate(dot(hit.normal, _DirectionalLight.xyz) * -1) * _DirectionalLight.w * hit.albedo.xyz;;
+    }
+    else
+    {
+        // Ray hit skybox
+        // Erase ray's energy, since the sky doesn't reflect anything
+        ray.energy = 0.0f;
+        // Sample the skybox and write it
+        float theta = acos(ray.direction.y) / -PI;
+        float phi   = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+        return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+    }
+}
+
+// Main Function
+[numthreads(8,8,1)]
+void ComputeShaderMain(uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    _Result.GetDimensions(width, height);
+    // Transform pixel to [-1, 1] range
+    float2 uv = float2(id.xy / float2(width, height) * 2.0f - 1.0f);
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+    // Trace ray and get result color
+    float3 result = 0.0f;
+    for (int i = 0; i < _RayTracingDepth; i++)
+    {
+        RayHit hit = Trace(ray);
+        result += ray.energy * Shade(ray, hit);
+
+        if (!any(ray.energy)) break;
+    }
+    
+    // _Result[id.xy] = _Source[id.xy] * float4(result, 1);
+    _Result[id.xy] = float4(result, 1);
+}
