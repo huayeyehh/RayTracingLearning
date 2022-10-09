@@ -48,13 +48,15 @@ public class RayTracingObjectRoot : MonoBehaviour
     private static List<BVHMeshObject> BVHMeshObjects = new List<BVHMeshObject>();
     private static List<BVHListNode> BVHNodeList = new List<BVHListNode>();
     private static List<Vector3> BVHVertices = new List<Vector3>();
+    private static List<Vector3> BVHNormals = new List<Vector3>();
     private ComputeBuffer BVHMeshObjectBuffer;
     private ComputeBuffer BVHNodeListBuffer;
     private ComputeBuffer BVHVerticesBuffer;
+    private ComputeBuffer BVHNormalsBuffer;
     private int BVHLeafCount;
 
     // Show BVH Gizmos or not
-    public enum GizmosMode{ Disable, BoundingBoxesOnly, RayIntercect }
+    public enum GizmosMode{ Disable, Triangles, BoundingBoxes, RayIntercect }
     public GizmosMode currentGizmosMode;
     public int GizmosBVHLevel = 1;  // 1 is the outer most bounding box
     // Camera for GizmosMode RayIntercect
@@ -91,17 +93,43 @@ public class RayTracingObjectRoot : MonoBehaviour
         // Variables declaration
         Vector3 bmin, bmax;
         BVHListNode node;
+        Queue<BVHListNode> queue = new Queue<BVHListNode>();
         switch (currentGizmosMode)
         {
-            case GizmosMode.BoundingBoxesOnly:
+            case GizmosMode.Triangles:
                 Gizmos.color = Color.yellow;
                 // Traverse the List to draw all nodes
-                Queue<BVHListNode> queue = new Queue<BVHListNode>();
+                queue.Enqueue(BVHNodeList[0]);
+                while (queue.Count > 0)
+                {
+                    node = queue.Dequeue();
+                    if (node.isLeaf == -1)
+                    {
+                        // Internal node
+                        queue.Enqueue(BVHNodeList[node.left]);
+                        queue.Enqueue(BVHNodeList[node.right]);
+                    }
+                    else
+                    {
+                        // Leaf node
+                        Matrix4x4 ltwm = BVHMeshObjects[node.extra].localToWorldMatrix;
+                        Vector3 v0 = ltwm.MultiplyPoint3x4(BVHVertices[node.left]);
+                        Vector3 v1 = ltwm.MultiplyPoint3x4(BVHVertices[node.right]);
+                        Vector3 v2 = ltwm.MultiplyPoint3x4(BVHVertices[node.isLeaf]);
+                        Gizmos.DrawLine(v0, v1);
+                        Gizmos.DrawLine(v1, v2);
+                        Gizmos.DrawLine(v2, v0);
+                    }
+                }
+                break;
+            case GizmosMode.BoundingBoxes:
+                Gizmos.color = Color.yellow;
+                // Traverse the List to draw all nodes
                 queue.Enqueue(BVHNodeList[0]);
                 int level = 1;
                 int currentLevelCount = 1;
                 int nextLevelCount = 0;
-                while (queue.Count > 0 && level < 20)
+                while (queue.Count > 0)
                 {
                     node = queue.Dequeue();
                     // Draw Bounding Boxes Gizmos
@@ -206,6 +234,7 @@ public class RayTracingObjectRoot : MonoBehaviour
     public ComputeBuffer GetBVHMeshObjectBuffer() { return BVHMeshObjectBuffer; }
     public ComputeBuffer GetBVHNodeListBuffer()   { return BVHNodeListBuffer; }
     public ComputeBuffer GetBVHVerticesBuffer()   { return BVHVerticesBuffer; }
+    public ComputeBuffer GetBVHNormalsBuffer()    { return BVHNormalsBuffer; }
     public int           GetBVHLeafCount()        { return BVHLeafCount; }
 
     // Clear data
@@ -216,6 +245,7 @@ public class RayTracingObjectRoot : MonoBehaviour
         indices.Clear();
         meshBVHNodesDictionary.Clear();
         BVHVertices.Clear();
+        BVHNormals.Clear();
         BVHMeshObjects.Clear();
         BVHNodeList.Clear();
         BVHLeafCount = 0;
@@ -229,9 +259,11 @@ public class RayTracingObjectRoot : MonoBehaviour
         if (BVHMeshObjectBuffer != null) BVHMeshObjectBuffer.Release();
         if (BVHNodeListBuffer != null)   BVHNodeListBuffer.Release();
         if (BVHVerticesBuffer != null)   BVHVerticesBuffer.Release();
+        if (BVHNormalsBuffer != null)    BVHNormalsBuffer.Release();
         BVHMeshObjectBuffer = null;
         BVHNodeListBuffer = null;
         BVHVerticesBuffer = null;
+        BVHNormalsBuffer = null;
     }
 
     // Collect all mesh filters in children and build computer buffers for compute shader
@@ -285,6 +317,7 @@ public class RayTracingObjectRoot : MonoBehaviour
         // Reset mesh data
         meshBVHNodesDictionary.Clear();
         BVHVertices.Clear();
+        BVHNormals.Clear();
         // Get all mesh filters and create BVH
         List<MeshFilter> mfs = new List<MeshFilter>(GetComponentsInChildren<MeshFilter>());
         foreach (MeshFilter mf in mfs)
@@ -292,6 +325,7 @@ public class RayTracingObjectRoot : MonoBehaviour
             // Add vertices to list
             int vertexOffset = BVHVertices.Count;
             BVHVertices.AddRange(mf.sharedMesh.vertices);
+            BVHNormals.AddRange(mf.sharedMesh.normals);
 
             // Create BVHTriangles from mesh
             List<BVHTriangle> triangles = BVHAccelerator.MeshToTriangles(mf.sharedMesh, vertexOffset);
@@ -351,13 +385,17 @@ public class RayTracingObjectRoot : MonoBehaviour
             // Create BVHMeshObject
             Material mat = leafs[i].meshFilter.transform.GetComponent<MeshRenderer>().sharedMaterial;
             float metallic = mat.GetFloat("_Metallic");
+            float smoothness = mat.GetFloat("_Glossiness");
+            Color color = mat.GetColor("_Color");
             int meshObjectIndex = BVHMeshObjects.Count;
             BVHMeshObjects.Add(new BVHMeshObject()
             {
                 localToWorldMatrix = leafs[i].meshFilter.transform.localToWorldMatrix,
-                albedo = mat.GetColor("_Color"),
-                specular = new Vector3(1.0f, 0.78f, 0.34f),
-                // specular = new Vector3(1.0f, 1.0f, 1.0f),
+                albedo = Vector4.zero,
+                // specular = new Vector3(metallic+smoothness, metallic+smoothness, metallic+smoothness)
+                // specular = new Vector3(1.0f, 0.78f, 0.34f)
+                // specular = new Vector3(1.0f, 1.0f, 1.0f)
+                specular = new Vector3(color.r, color.g, color.b)
             });
 
             // Traverse mesh BVH
@@ -402,6 +440,7 @@ public class RayTracingObjectRoot : MonoBehaviour
         CreateComputeBuffer(ref BVHMeshObjectBuffer, BVHMeshObjects, 92);
         CreateComputeBuffer(ref BVHNodeListBuffer, BVHNodeList, 40);
         CreateComputeBuffer(ref BVHVerticesBuffer, BVHVertices, 12);
+        CreateComputeBuffer(ref BVHNormalsBuffer, BVHNormals, 12);
     }
 
     // Create the corresponding compute buffer
@@ -444,6 +483,7 @@ public class RayTracingObjectRoot : MonoBehaviour
         Debug.Log("BVHMeshObjects size: " + BVHMeshObjects.Count);
         Debug.Log("BVHNodeList size: " + BVHNodeList.Count);
         Debug.Log("BVHVertices size: " + BVHVertices.Count);
+        Debug.Log("BVHNormals size: " + BVHNormals.Count);
 
         ClearData();
     }
@@ -455,11 +495,14 @@ public class RayTracingObjectRoot : MonoBehaviour
         BuildMeshBVHNodes();
         BuildBVHBuffers();
 
+        int leafCount = 0;
         for (int i = 0; i < BVHNodeList.Count; i++)
         {
-            if (BVHNodeList[i].isLeaf == -1)
-                Debug.Log("Node #" + i + ": left->" + BVHNodeList[i].left + ", right->" + BVHNodeList[i].right);
+            if (BVHNodeList[i].isLeaf != -1)
+                leafCount++;
         }
+        Debug.Log("Total node: " + BVHNodeList.Count + ", leaf node: " + leafCount);
+        Debug.Log("One node uses 40 bytes, totally " + (BVHNodeList.Count * 40) + " bytes.");
 
         ClearData();
     }

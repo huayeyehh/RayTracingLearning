@@ -69,6 +69,7 @@ int _MeshObjectsCount;
 StructuredBuffer<BVHMeshObject> _BVHMeshObjects;
 StructuredBuffer<BVHListNode>   _BVHNodeList;
 StructuredBuffer<float3>        _BVHVertices;
+StructuredBuffer<float3>        _BVHNormals;
 int _BVHLeafCount;
 
 /* -------------------- Local Variables -------------------- */
@@ -122,8 +123,8 @@ void IntersectGroundPlane(Ray ray, inout RayHit bestHit)
         bestHit.distance = t;
         bestHit.position = ray.origin + t * ray.direction;
         bestHit.normal   = float3(0.0f, 1.0f, 0.0f);  // normal of ground is always up
-        bestHit.specular = 0.7f;
-        bestHit.albedo   = 0.0f;
+        bestHit.specular = 0.02f;
+        bestHit.albedo   = float4(1.0f, 0.9f, 1.0f, 1.0f);
     }
 }
 
@@ -261,9 +262,10 @@ void IntersectBVH(Ray ray, inout RayHit bestHit, float3 dirInv, bool3 dirIsNeg)
                     {
                         bestHit.distance = t;
                         bestHit.position = ray.origin + t * ray.direction;
-                        bestHit.normal   = normalize(cross(v1 - v0, v2 - v0));
                         bestHit.albedo   = _BVHMeshObjects[node.extra].albedo;
                         bestHit.specular = _BVHMeshObjects[node.extra].specular;
+                        // Smoothing normal. TODO: Objects that rotated will have different normals and simply mul(localToWorldMatrix does not work)
+                        bestHit.normal   = u*_BVHNormals[node.right] + v*_BVHNormals[node.isLeaf] + (1-u-v)*_BVHNormals[node.left];
                     }
                 }
             }
@@ -307,7 +309,7 @@ float3 Shade(inout Ray ray, RayHit hit)
         RayHit shadowHit = Trace(shadowRay);
         if (shadowHit.distance < 1.#INF) return float3(0.0f, 0.0f, 0.0f);
 
-        // Return color not in shadow, TODO: get color from texture, transparent mat
+        // Return color not in shadow
         return saturate(dot(hit.normal, _DirectionalLight.xyz) * -1) * _DirectionalLight.w * hit.albedo.xyz;;
     }
     else

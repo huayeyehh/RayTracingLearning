@@ -131,6 +131,7 @@ public class RayTracingPostProcess : MonoBehaviour
             SetBufferToShader(0, "_BVHMeshObjects",  rayTracingObjectRoot.GetBVHMeshObjectBuffer());
             SetBufferToShader(0, "_BVHNodeList",     rayTracingObjectRoot.GetBVHNodeListBuffer());
             SetBufferToShader(0, "_BVHVertices",     rayTracingObjectRoot.GetBVHVerticesBuffer());
+            SetBufferToShader(0, "_BVHNormals",      rayTracingObjectRoot.GetBVHNormalsBuffer());
             rayTracingShader.SetInt("_BVHLeafCount", rayTracingObjectRoot.GetBVHLeafCount());
         }
     }

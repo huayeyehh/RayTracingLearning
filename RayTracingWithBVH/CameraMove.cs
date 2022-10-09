@@ -43,6 +43,9 @@ public class CameraMove : MonoBehaviour
             if (newMousePos != mousePos) {
                 Vector3 delta = (newMousePos - mousePos) * rotateSpeed * Time.deltaTime;
                 transform.localEulerAngles += new Vector3(-delta.y, delta.x, 0);
+                // When x is 90 or 270, the z of localEulerAngles will become 180 =_=
+                if (transform.localEulerAngles.z != 0)
+                    transform.localEulerAngles = new Vector3(transform.localEulerAngles.x, transform.localEulerAngles.y, 0);
                 mousePos = newMousePos;
             }
         }
